@@ -1,0 +1,140 @@
+heat_template_version: 2013-05-23
+
+description: "VM для Java 23 приложения (Adoptium)"
+
+parameters:
+  key_name:
+    type: string
+    description: "Имя SSH ключа для доступа к VM"
+    default: lobanov
+  
+  flavor:
+    type: string
+    description: "Размер виртуальной машины"
+    default: m1.small
+  
+  image:
+    type: string
+    description: "Образ операционной системы"
+    default: ununtu-20.04
+
+resources:
+  # Группа безопасности (фаервол)
+  app_security_group:
+    type: OS::Neutron::SecurityGroup
+    deletion_policy: Delete 
+    properties:
+      name: app_sg
+      description: "Security group for Java application"
+      rules:
+        # SSH для подключения
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+          remote_ip_prefix: 0.0.0.0/0
+        
+        # Порт приложения (из docker-compose: 8080:8080)
+        - protocol: tcp
+          port_range_min: 8080
+          port_range_max: 8080
+          remote_ip_prefix: 0.0.0.0/0
+
+  # Виртуальная машина с приложением
+  app_server:
+    type: OS::Nova::Server
+    deletion_policy: Delete 
+    properties:
+      name: lobanov-bot-vm
+      flavor: { get_param: flavor }
+      image: { get_param: image }
+      key_name: { get_param: key_name }
+      security_groups:
+        - default
+        - { get_resource: app_security_group }
+      
+      # Скрипт инициализации — выполнится при первом запуске VM
+      user_ |
+        #!/bin/bash
+        set -e  # Остановиться при ошибке
+        
+        # === 1. Обновление и установка зависимостей ===
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y \
+          wget \
+          apt-transport-https \
+          gnupg \
+          curl
+        
+        # === 2. Установка Java 23 через Adoptium репозиторий ===
+        # Добавляем GPG-ключ
+        wget -O - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor -o /usr/share/keyrings/adoptium.gpg
+        
+        # Добавляем репозиторий
+        echo "deb [signed-by=/usr/share/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/adoptium.list
+        
+        # Обновляем и устанавливаем Java 23
+        apt-get update
+        apt-get install -y temurin-23-jdk
+        
+        # Проверяем установку
+        java -version
+        javac -version
+        
+        # === 3. Создание директории для приложения ===
+        mkdir -p /opt/myapp
+        mkdir -p /opt/myapp/logs
+        chown -R ubuntu:ubuntu /opt/myapp
+        
+        # === 4. Создание systemd сервиса ===
+        cat > /etc/systemd/system/myapp.service << 'EOF'
+        [Unit]
+        Description=Java Application Service
+        After=network.target
+        
+        [Service]
+        Type=simple
+        User=ubuntu
+        Group=ubuntu
+        WorkingDirectory=/opt/myapp
+        ExecStart=/usr/bin/java -Xmx512m -jar /opt/myapp/app.jar
+        Restart=on-failure
+        RestartSec=10
+        StandardOutput=journal
+        StandardError=journal
+        SyslogIdentifier=myapp
+        
+        # Переменные окружения для приложения
+        Environment="JAVA_HOME=/usr/lib/jvm/temurin-23-jdk-amd64"
+        Environment="VAULT_ADDR=http://localhost:8200"
+        Environment="VAULT_TOKEN=root"
+        Environment="SERVER_PORT=8080"
+        Environment="MONGO_INITDB_ROOT_USERNAME=root"
+        Environment="MONGO_INITDB_ROOT_PASSWORD=example"
+        Environment="MONGO_INITDB_DATABASE=BitBotDB"
+        
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+        
+        # === 5. Активация сервиса ===
+        systemctl daemon-reload
+        systemctl enable myapp
+        
+        # === 6. Финальное сообщение ===
+        echo "Java 23 установлена. Сервис myapp готов к запуску."
+        echo "Скопируйте app.jar в /opt/myapp/ и выполните: sudo systemctl start myapp"
+
+# Выходные параметры — чтобы узнать IP после создания
+outputs:
+  server_ip:
+    description: "Публичный IP адрес сервера"
+    value: { get_attr: [app_server, first_address] }
+  
+  server_id:
+    description: "ID созданного сервера"
+    value: { get_ref: app_server }
+  
+  ssh_command:
+    description: "Команда для подключения по SSH"
+    value: { str_replace: { template: "ssh -i <key> ubuntu@${ip}", params: { ip: { get_attr: [app_server, first_address] } } } }
