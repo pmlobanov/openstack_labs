@@ -84,7 +84,7 @@ resources:
       user_data_format: RAW
       
       # Скрипт инициализации
-      user_ |
+      user_data |
         #!/bin/bash
         set -e
         
