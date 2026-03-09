@@ -1,7 +1,8 @@
 heat_template_version: 2013-05-23
 
-description: "VM для Java 23 приложения (Adoptium)"
+description: "VM для Java 23 приложения с Docker (lobanov-bot)"
 
+# Параметры
 parameters:
   key_name:
     type: string
@@ -16,16 +17,26 @@ parameters:
   image:
     type: string
     description: "Образ операционной системы"
-    default: ununtu-20.04
+    default: ubuntu-20.04
+  
+  network_name:
+    type: string
+    description: "Имя сети для подключения VM"
+    default: public
+  
+  owner:
+    type: string
+    description: "Владелец машины (имя агента)"
+    default: lobanov
 
 resources:
   # Группа безопасности (фаервол)
   app_security_group:
     type: OS::Neutron::SecurityGroup
-    deletion_policy: Delete 
+    deletion_policy: Delete
     properties:
-      name: app_sg
-      description: "Security group for Java application"
+      name: lobanov-bot-sg
+      description: "Security group for lobanov-bot application"
       rules:
         # SSH для подключения
         - protocol: tcp
@@ -33,63 +44,109 @@ resources:
           port_range_max: 22
           remote_ip_prefix: 0.0.0.0/0
         
-        # Порт приложения (из docker-compose: 8080:8080)
+        # Порт приложения
         - protocol: tcp
           port_range_min: 8080
           port_range_max: 8080
+          remote_ip_prefix: 0.0.0.0/0
+        
+        # Docker registry (опционально)
+        - protocol: tcp
+          port_range_min: 5000
+          port_range_max: 5000
           remote_ip_prefix: 0.0.0.0/0
 
   # Виртуальная машина с приложением
   app_server:
     type: OS::Nova::Server
-    deletion_policy: Delete 
+    deletion_policy: Delete
     properties:
-      name: lobanov-bot-vm
+      # Динамическое имя сервера
+      name: 
+        str_replace:
+          template: "lobanov-bot-vm-${owner}"
+          params:
+            ${owner}: { get_param: owner }
+      
       flavor: { get_param: flavor }
       image: { get_param: image }
       key_name: { get_param: key_name }
+      
+      # Подключение к сети
+      networks:
+        - network: { get_param: network_name }
+      
       security_groups:
         - default
         - { get_resource: app_security_group }
       
-      # Скрипт инициализации — выполнится при первом запуске VM
+      # Формат user-data
+      user_data_format: RAW
+      
+      # Скрипт инициализации
       user_ |
         #!/bin/bash
-        set -e  # Остановиться при ошибке
+        set -e
         
-        # === 1. Обновление и установка зависимостей ===
+        # Логирование всех действий
+        exec > /var/log/heat-setup.log 2>&1
+        echo "Начало установки: $(date)"
+        
+        # === 1. Обновление системы ===
+        echo "1. Обновление пакетов системы"
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update
-        apt-get install -y \
-          wget \
-          apt-transport-https \
-          gnupg \
-          curl
+        apt-get update -y
+        apt-get upgrade -y
         
-        # === 2. Установка Java 23 через Adoptium репозиторий ===
-        # Добавляем GPG-ключ
-        wget -O - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor -o /usr/share/keyrings/adoptium.gpg
+        # === 2. Установка Java 23 (Adoptium) ===
+        echo "2. Установка Java 23"
+        apt-get install -y wget apt-transport-https gnupg curl
+        
+        # Добавляем GPG-ключ Adoptium
+        wget -q https://packages.adoptium.net/artifactory/api/gpg/key/public -O - | gpg --dearmor -o /usr/share/keyrings/adoptium.gpg
         
         # Добавляем репозиторий
         echo "deb [signed-by=/usr/share/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/adoptium.list
         
-        # Обновляем и устанавливаем Java 23
         apt-get update
         apt-get install -y temurin-23-jdk
         
-        # Проверяем установку
+        echo "Проверка Java:"
         java -version
         javac -version
         
-        # === 3. Создание директории для приложения ===
+        # === 3. Установка Docker ===
+        echo "3. Установка Docker"
+        apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+        
+        # Добавление GPG ключа Docker
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+        
+        # Добавление репозитория Docker
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+        
+        apt-get update
+        apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+        
+        echo "Проверка Docker:"
+        docker --version
+        docker compose version
+        
+        # Настройка прав для Docker
+        echo "4. Настройка прав для Docker"
+        usermod -aG docker ubuntu
+        
+        # === 5. Создание директории для приложения ===
+        echo "5. Создание директорий"
         mkdir -p /opt/myapp
         mkdir -p /opt/myapp/logs
         chown -R ubuntu:ubuntu /opt/myapp
         
-        # === 4. Создание systemd сервиса ===
+        # === 6. Создание systemd сервиса ===
+        echo "6. Создание systemd сервиса"
         cat > /etc/systemd/system/myapp.service << 'EOF'
         [Unit]
-        Description=Java Application Service
+        Description=Lobanov Bot Java Service
         After=network.target
         
         [Service]
@@ -104,7 +161,7 @@ resources:
         StandardError=journal
         SyslogIdentifier=myapp
         
-        # Переменные окружения для приложения
+        # Переменные окружения
         Environment="JAVA_HOME=/usr/lib/jvm/temurin-23-jdk-amd64"
         Environment="VAULT_ADDR=http://localhost:8200"
         Environment="VAULT_TOKEN=root"
@@ -117,24 +174,54 @@ resources:
         WantedBy=multi-user.target
         EOF
         
-        # === 5. Активация сервиса ===
+        # === 7. Активация сервиса ===
+        echo "7. Активация сервиса"
         systemctl daemon-reload
         systemctl enable myapp
         
-        # === 6. Финальное сообщение ===
-        echo "Java 23 установлена. Сервис myapp готов к запуску."
-        echo "Скопируйте app.jar в /opt/myapp/ и выполните: sudo systemctl start myapp"
+        # === 8. Установка дополнительных утилит ===
+        echo "8. Установка дополнительных утилит"
+        apt-get install -y git net-tools htop jq
+        
+        # === 9. Финальное сообщение ===
+        touch /tmp/user-data-completed
+        echo "✅ Установка завершена: $(date)"
+        echo "📋 Лог установки доступен в /var/log/heat-setup.log"
 
-# Выходные параметры — чтобы узнать IP после создания
+# Выходные параметры
 outputs:
   server_ip:
     description: "Публичный IP адрес сервера"
     value: { get_attr: [app_server, first_address] }
   
+  server_name:
+    description: "Имя созданной VM"
+    value: { get_attr: [app_server, name] }
+  
   server_id:
-    description: "ID созданного сервера"
+    description: "ID сервера"
     value: { get_ref: app_server }
   
   ssh_command:
     description: "Команда для подключения по SSH"
-    value: { str_replace: { template: "ssh -i <key> ubuntu@${ip}", params: { ip: { get_attr: [app_server, first_address] } } } }
+    value:
+      str_replace:
+        template: "ssh -i <key> ubuntu@$ip"
+        params:
+          $ip: { get_attr: [app_server, first_address] }
+  
+  setup_log:
+    description: "Инструкция для просмотра лога установки"
+    value: "sudo cat /var/log/heat-setup.log"
+  
+  check_status:
+    description: "Проверка завершения установки"
+    value: "ssh -i <key> ubuntu@$ip 'test -f /tmp/user-data-completed && echo OK || echo NOT_READY'"
+  
+  service_status:
+    description: "Проверка статуса сервиса"
+    value: "ssh -i <key> ubuntu@$ip 'sudo systemctl status myapp --no-pager'"
+  
+  docker_status:
+    description: "Проверка Docker"
+    value: "ssh -i <key> ubuntu@$ip 'docker --version && docker compose version'"
