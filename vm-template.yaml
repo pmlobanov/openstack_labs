@@ -17,12 +17,12 @@ parameters:
   image:
     type: string
     description: "Образ операционной системы"
-    default: ubuntu-20.04
+    default: ununtu-22.04
   
   network_name:
     type: string
     description: "Имя сети для подключения VM"
-    default: public
+    default: sutdents-net
   
   owner:
     type: string
