@@ -64,7 +64,7 @@ resources:
       # Динамическое имя сервера
       name: 
         str_replace:
-          template: "lobanov-bot-vm-${owner}"
+          template: "bitbotx-vm-${owner}"
           params:
             ${owner}: { get_param: owner }
       
